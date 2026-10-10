@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>FPS プロトタイプ</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>
+:root{--bg:#111;--fg:#eee}
+html,body{margin:0;height:100%;background:#111;color:#eee;font-family:system-ui,sans-serif;overflow:hidden}
+canvas{display:block}
+#hud{position:fixed;inset:0;pointer-events:none;font-size:14px}
+#cross{position:absolute;left:50%;top:50%;width:0;height:0}
+#cross i{position:absolute;background:#fff;opacity:.9}
+#hit{position:absolute;left:50%;top:50%;width:26px;height:26px;margin:-13px;border:2px solid #f44;transform:rotate(45deg);opacity:0;transition:opacity .15s}
+#ammo{position:absolute;right:20px;bottom:20px;font-size:36px;font-weight:700;text-shadow:0 0 4px #000}
+#ammo small{font-size:18px;opacity:.8}
+#info{position:absolute;left:20px;bottom:20px;text-shadow:0 0 4px #000;line-height:1.6}
+#stbar{width:160px;height:8px;background:#333;margin-top:4px}
+#st{height:100%;background:#4cf;width:100%}
+#msg{position:absolute;left:50%;top:60%;transform:translateX(-50%);font-size:20px;text-shadow:0 0 4px #000}
+#ov{position:fixed;inset:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;text-align:center;cursor:pointer;line-height:1.8}
+#ov h1{margin:0 0 8px}
+</style>
+</head>
+<body>
+<div id="hud">
+  <div id="cross"><i style="left:-10px;top:-1px;width:7px;height:2px"></i><i style="left:3px;top:-1px;width:7px;height:2px"></i><i style="left:-1px;top:-10px;width:2px;height:7px"></i><i style="left:-1px;top:3px;width:2px;height:7px"></i></div>
+  <div id="hit"></div>
+  <div id="msg"></div>
+  <div id="info"><div id="stance"></div><div>STAMINA</div><div id="stbar"><div id="st"></div></div><div id="kills"></div></div>
+  <div id="ammo"><span id="mag">30</span> <small>/ <span id="res">90</span></small></div>
+</div>
+<div id="ov"><div><h1>クリックで開始</h1>
+WASD 移動 / マウス 視点 / 左クリック 射撃 / 右クリック ADS<br>
+R リロード / Shift ダッシュ / C しゃがみ / Z 伏せ / Esc メニュー<br>
+<small>カーソルがロックされない環境ではマウス移動だけで視点が動きます</small></div></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const renderer=new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth,innerHeight);document.body.prepend(renderer.domElement);
+const scene=new THREE.Scene();scene.background=new THREE.Color(0x8fb4d9);scene.fog=new THREE.Fog(0x8fb4d9,20,60);
+const cam=new THREE.PerspectiveCamera(75,innerWidth/innerHeight,.05,100);cam.rotation.order='YXZ';scene.add(cam);
+scene.add(new THREE.HemisphereLight(0xffffff,0x556655,.9));
+const sun=new THREE.DirectionalLight(0xffffff,.6);sun.position.set(10,20,5);scene.add(sun);
+addEventListener('resize',()=>{renderer.setSize(innerWidth,innerHeight);cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix()});
+
+// ---- Map ----
+const floor=new THREE.Mesh(new THREE.PlaneGeometry(40,40),new THREE.MeshLambertMaterial({color:0x6b7b5a}));
+floor.rotation.x=-Math.PI/2;scene.add(floor);scene.add(new THREE.GridHelper(40,40,0x444444,0x555555));
+const walls=[],targets=[];
+function box(x,z,w,d,h,c){const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),new THREE.MeshLambertMaterial({color:c}));
+ m.position.set(x,h/2,z);scene.add(m);walls.push({x,z,w,d});targets.push(m);return m}
+box(0,-20,40,1,4,0x777777);box(0,20,40,1,4,0x777777);box(-20,0,1,40,4,0x777777);box(20,0,1,40,4,0x777777);
+[[-6,-4,3,3,1.5],[6,-8,2,2,1.2],[0,-12,8,.6,2.5],[-10,-12,2,2,2],[9,2,3,3,1.5],[-4,6,6,.6,2.5],[12,-14,2,2,1.5]]
+ .forEach(a=>box(a[0],a[1],a[2],a[3],a[4],0x9a7b52));
+
+// ---- Enemies (boxes) ----
+const enemies=[];let kills=0;
+function spawnEnemy(x,z){
+ const g=new THREE.Group();
+ const body=new THREE.Mesh(new THREE.BoxGeometry(.7,1.4,.4),new THREE.MeshLambertMaterial({color:0xb03030}));body.position.y=.7;
+ const head=new THREE.Mesh(new THREE.BoxGeometry(.35,.35,.35),new THREE.MeshLambertMaterial({color:0xd08060}));head.position.y=1.6;
+ body.userData={enemy:g};head.userData={enemy:g,head:true};g.add(body,head);g.position.set(x,0,z);
+ g.userData={hp:100,body,head,flash:0,bx:x,bz:z,ph:Math.random()*6,dead:0};scene.add(g);targets.push(body,head);enemies.push(g)}
+[[-8,-8],[8,-4],[0,-16],[-14,8],[14,10],[0,12],[-12,-16],[15,-16]].forEach(p=>spawnEnemy(...p));
+
+// ---- Player ----
+const P={x:0,z:14,vx:0,vz:0,yaw:0,pitch:0,eye:1.7,stance:0,stamina:100,sprint:false,exhaust:false,r:.4};
+const STANCE=[{n:'立ち',h:1.7,s:4.5},{n:'しゃがみ',h:1.1,s:2.2},{n:'伏せ',h:.55,s:1.0}];
+const W={mag:30,res:90,max:30,interval:.1,cd:0,reloading:false,rt:0,rdur:0,applied:false,recY:0,recX:0,ads:0,spread:0};
+const keys={};let mouseL=false,mouseR=false,locked=false,started=false;
+const SENS=.0022;
+
+// gun model
+const gun=new THREE.Group();
+const gb=new THREE.Mesh(new THREE.BoxGeometry(.07,.09,.55),new THREE.MeshLambertMaterial({color:0x222222}));
+const gm=new THREE.Mesh(new THREE.BoxGeometry(.06,.16,.08),new THREE.MeshLambertMaterial({color:0x333333}));gm.position.set(0,-.1,.05);
+const flash=new THREE.Mesh(new THREE.BoxGeometry(.1,.1,.12),new THREE.MeshBasicMaterial({color:0xffcc44}));flash.position.z=-.34;flash.visible=false;
+gun.add(gb,gm,flash);cam.add(gun);
+
+// ---- Input ----
+$('ov').addEventListener('click',()=>{started=true;$('ov').style.display='none';
+ try{const p=renderer.domElement.requestPointerLock();if(p&&p.catch)p.catch(()=>{})}catch(e){}});
+document.addEventListener('pointerlockchange',()=>{locked=document.pointerLockElement===renderer.domElement;
+ if(!locked&&started&&!fallback){$('ov').style.display='flex';started=false}});
+let fallback=false;document.addEventListener('pointerlockerror',()=>{fallback=true;started=true;$('ov').style.display='none'});
+addEventListener('keydown',e=>{if(e.repeat)return;keys[e.code]=true;
+ if(e.code==='KeyR')startReload();
+ if(e.code==='KeyC')P.stance=P.stance===1?0:1;
+ if(e.code==='KeyZ')P.stance=P.stance===2?0:2;
+ if(e.code==='Escape'&&fallback){started=false;$('ov').style.display='flex'}});
+addEventListener('keyup',e=>keys[e.code]=false);
+addEventListener('mousemove',e=>{if(!started||(!locked&&!fallback))return;
+ P.yaw-=e.movementX*SENS*(1-W.ads*.5);
+ P.pitch-=e.movementY*SENS*(1-W.ads*.5);
+ P.pitch=Math.max(-80*Math.PI/180,Math.min(80*Math.PI/180,P.pitch))});
+addEventListener('mousedown',e=>{if(e.button===0)mouseL=true;if(e.button===2)mouseR=true});
+addEventListener('mouseup',e=>{if(e.button===0)mouseL=false;if(e.button===2)mouseR=false});
+addEventListener('contextmenu',e=>e.preventDefault());
+
+// ---- Audio ----
+let ac;function sfx(freq,dur,vol){try{ac=ac||new AudioContext();const n=ac.createBufferSource(),b=ac.createBuffer(1,ac.sampleRate*dur,ac.sampleRate),d=b.getChannelData(0);
+ for(let i=0;i<d.length;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/d.length,3);n.buffer=b;
+ const f=ac.createBiquadFilter();f.frequency.value=freq;const g=ac.createGain();g.gain.value=vol;n.connect(f).connect(g).connect(ac.destination);n.start()}catch(e){}}
+
+// ---- Reload ----
+function startReload(){
+ if(W.reloading||W.mag>=W.max||W.res<=0||P.sprint)return;
+ W.reloading=true;W.rt=0;W.applied=false;W.rdur=W.mag>0?1.8:2.6; // tactical / dry
+ $('msg').textContent=W.mag>0?'タクティカルリロード':'ドライリロード';sfx(1500,.08,.3)}
+function updateReload(dt){
+ if(!W.reloading)return;W.rt+=dt;
+ if(!W.applied&&W.rt>=W.rdur*.65){const n=Math.min(W.max-W.mag,W.res);W.mag+=n;W.res-=n;W.applied=true;sfx(2500,.06,.3)}
+ if(W.rt>=W.rdur){W.reloading=false;$('msg').textContent=''}}
+
+// ---- Shooting ----
+const ray=new THREE.Raycaster(),tracers=[];
+function shoot(){
+ W.mag--;W.cd=W.interval;
+ const sp=W.spread;const dir=new THREE.Vector3((Math.random()-.5)*2*sp,(Math.random()-.5)*2*sp,-1).normalize();
+ ray.setFromCamera({x:0,y:0},cam);
+ dir.applyQuaternion(cam.quaternion);ray.set(cam.getWorldPosition(new THREE.Vector3()),dir);
+ const hits=ray.intersectObjects(targets,false);
+ const mp=new THREE.Vector3();flash.getWorldPosition(mp);
+ let end=ray.ray.origin.clone().addScaledVector(dir,60);
+ if(hits.length){end=hits[0].point;const o=hits[0].object,ud=o.userData;
+  if(ud.enemy&&ud.enemy.userData.dead===0){const e=ud.enemy.userData;e.hp-=ud.head?100:34;e.flash=.1;
+   $('hit').style.opacity=1;setTimeout(()=>$('hit').style.opacity=0,120);
+   if(e.hp<=0){e.dead=3;ud.enemy.visible=false;kills++;$('kills').textContent='KILL: '+kills}}
+  else if(!ud.enemy){const s=new THREE.Mesh(new THREE.SphereGeometry(.05),new THREE.MeshBasicMaterial({color:0x111111}));s.position.copy(end);scene.add(s);setTimeout(()=>scene.remove(s),4000)}}
+ const l=new THREE.Line(new THREE.BufferGeometry().setFromPoints([mp,end]),new THREE.LineBasicMaterial({color:0xffee88}));scene.add(l);tracers.push({l,t:.05});
+ // recoil
+ W.recY+=(.012+Math.random()*.004)*(1-W.ads*.3);W.recX+=(Math.random()-.5)*.008;
+ flash.visible=true;setTimeout(()=>flash.visible=false,40);sfx(900,.12,.5);gun.position.z+=.04}
+
+// ---- Collision ----
+function collide(nx,nz,ox,oz){
+ for(const w of walls){const hx=w.w/2+P.r,hz=w.d/2+P.r;
+  if(Math.abs(nx-w.x)<hx&&Math.abs(nz-w.z)<hz){
+   if(Math.abs(ox-w.x)>=hx)nx=ox;else if(Math.abs(oz-w.z)>=hz)nz=oz;else{nx=ox;nz=oz}}}
+ return[nx,nz]}
+
+// ---- Loop ----
+let last=performance.now(),clock=0;
+function frame(now){
+ requestAnimationFrame(frame);const dt=Math.min(.05,(now-last)/1e3);last=now;clock+=dt;
+ if(started){
+  const st=STANCE[P.stance];
+  // input vector
+  let ix=(keys.KeyD?1:0)-(keys.KeyA?1:0),iz=(keys.KeyW?1:0)-(keys.KeyS?1:0);
+  const len=Math.hypot(ix,iz);if(len>0){ix/=len;iz/=len}
+  // sprint + stamina
+  const want=keys.ShiftLeft&&iz>0&&P.stance===0&&!W.reloading&&!mouseR&&!P.exhaust;
+  P.sprint=want&&P.stamina>0;
+  if(P.sprint){P.stamina=Math.max(0,P.stamina-25*dt);if(P.stamina<=0)P.exhaust=true}
+  else P.stamina=Math.min(100,P.stamina+15*dt);
+  if(P.exhaust&&P.stamina>=25)P.exhaust=false;
+  let speed=st.s*(P.sprint?1.7:1)*(W.reloading?.7:1)*(1-W.ads*.35);
+  // yaw-based world vector
+  const fx=-Math.sin(P.yaw),fz=-Math.cos(P.yaw),rx=Math.cos(P.yaw),rz=-Math.sin(P.yaw);
+  const tx=(fx*iz+rx*ix)*speed,tz=(fz*iz+rz*ix)*speed;
+  // inertia
+  const k=1-Math.exp(-(len>0?10:7)*dt);P.vx+=(tx-P.vx)*k;P.vz+=(tz-P.vz)*k;
+  const [nx,nz]=collide(P.x+P.vx*dt,P.z+P.vz*dt,P.x,P.z);P.x=nx;P.z=nz;
+  // stance lerp
+  P.eye+=(st.h-P.eye)*(1-Math.exp(-10*dt));
+  // ADS
+  W.ads+=((mouseR&&!P.sprint?1:0)-W.ads)*(1-Math.exp(-12*dt));
+  cam.fov=75-30*W.ads;cam.updateProjectionMatrix();
+  // spread
+  const moving=Math.hypot(P.vx,P.vz)/4.5;
+  W.spread=(.035+.02*moving)*(1-W.ads*.88)*(P.stance?0.7:1);
+  // fire
+  W.cd-=dt;updateReload(dt);
+  if(mouseL&&W.cd<=0&&!W.reloading&&!P.sprint){
+   if(W.mag>0)shoot();else{W.cd=.3;sfx(3000,.03,.3);startReload()}}
+  // recoil recovery
+  if(!(mouseL&&W.mag>0)||W.cd>0){const r=1-Math.exp(-7*dt);W.recY-=W.recY*r;W.recX-=W.recX*r}
+  // camera
+  const bob=Math.sin(clock*(P.sprint?14:9))*Math.min(1,Math.hypot(P.vx,P.vz)/4)*.02*(1-W.ads);
+  cam.position.set(P.x,P.eye+bob,P.z);
+  cam.rotation.y=P.yaw+W.recX;cam.rotation.x=P.pitch+W.recY;
+  // gun pose
+  const hip=new THREE.Vector3(.25,-.22,-.5),ads=new THREE.Vector3(0,-.145,-.38);
+  const gp=hip.clone().lerp(ads,W.ads);
+  let rr=0;if(W.reloading){const q=W.rt/W.rdur;rr=Math.sin(Math.PI*q)}
+  if(P.sprint)rr=Math.max(rr,.6);
+  gun.position.x+=(gp.x-gun.position.x)*.3;gun.position.y+=(gp.y-rr*.25-gun.position.y)*.3;gun.position.z+=(gp.z-gun.position.z)*.3;
+  gun.rotation.x=rr*.6;gun.rotation.z=P.sprint?.5:0;
+ }
+ // enemies
+ for(const e of enemies){const u=e.userData;
+  if(u.dead>0){u.dead-=dt;if(u.dead<=0){u.dead=0;u.hp=100;e.visible=true}continue}
+  e.position.x=u.bx+Math.sin(clock*.8+u.ph)*2;e.rotation.y=Math.atan2(P.x-e.position.x,P.z-e.position.z);
+  if(u.flash>0){u.flash-=dt;u.body.material.emissive.setHex(0xffffff)}else u.body.material.emissive.setHex(0)}
+ // tracers
+ for(let i=tracers.length-1;i>=0;i--){tracers[i].t-=dt;if(tracers[i].t<=0){scene.remove(tracers[i].l);tracers.splice(i,1)}}
+ // HUD
+ $('mag').textContent=W.mag;$('res').textContent=W.res;
+ $('stance').textContent='姿勢: '+STANCE[P.stance].n+(P.sprint?' (ダッシュ)':'')+(W.ads>.5?' / ADS':'');
+ $('st').style.width=P.stamina+'%';$('st').style.background=P.exhaust?'#f84':'#4cf';
+ renderer.render(scene,cam)}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
